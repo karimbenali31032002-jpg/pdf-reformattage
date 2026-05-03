@@ -1,0 +1,6 @@
+{
+  "name": "Remix: Residanat Formatter",
+  "description": "Reformateur intelligent de cours médicaux vers des documents Word (.docx) structurés et enrichis pour le résidanat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
