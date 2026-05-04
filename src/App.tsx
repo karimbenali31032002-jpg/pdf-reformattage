@@ -56,33 +56,58 @@ export default function App() {
         body: formData,
       });
 
+      let extractData;
+      const responseTextForDebug = await extractResponse.text();
+      
       if (!extractResponse.ok) {
-        const errData = await extractResponse.json();
-        throw new Error(errData.error || "Erreur lors de l'extraction du texte.");
+        let errorMsg = "Erreur lors de l'extraction du texte.";
+        try {
+          const errJSON = JSON.parse(responseTextForDebug);
+          errorMsg = errJSON.error || errorMsg;
+        } catch (e) {
+          console.error("Server error (not JSON):", responseTextForDebug);
+        }
+        throw new Error(errorMsg);
       }
 
-      const { text: rawText } = await extractResponse.json();
+      try {
+        extractData = JSON.parse(responseTextForDebug);
+      } catch (e) {
+        console.error("Extraction response was NOT JSON:", responseTextForDebug.substring(0, 500));
+        throw new Error("La réponse du serveur d'extraction est invalide (format non-JSON).");
+      }
+      
+      const { text: rawText, imagesCount } = extractData;
 
       // 2. AI Analysis via GoogleGenAI in browser - CHUNKED PROCESSING
-      setProgressMsg("Analyse par l'IA (Traitement intégral en cours)...");
+      setProgressMsg(`Analyse par l'IA (${imagesCount} images détectées)...`);
       
-      const CHUNK_SIZE = 15000; // Optimal size for verbatim response
+      const CHUNK_SIZE = 25000; 
+      const OVERLAP_SIZE = 5000; 
       const textChunks = [];
-      for (let i = 0; i < rawText.length; i += CHUNK_SIZE) {
+      
+      for (let i = 0; i < rawText.length; i += (CHUNK_SIZE - OVERLAP_SIZE)) {
         textChunks.push(rawText.slice(i, i + CHUNK_SIZE));
+        if (i + CHUNK_SIZE >= rawText.length) break;
       }
 
       const fullStructuredSections = [];
       let courseTitle = "";
       let courseMatter = "";
+      let courseObjectives: string[] = [];
       let courseKeyTerms: string[] = [];
 
       for (let i = 0; i < textChunks.length; i++) {
-        setProgressMsg(`Traitement de la partie ${i + 1} sur ${textChunks.length}...`);
+        setProgressMsg(`Structuration partie ${i + 1}/${textChunks.length}...`);
         
         const chunkPrompt = `
-          Tu es un assistant expert en structuration de cours médicaux.
-          TON OBJECTIF : Convertir ce texte brut en JSON sans perdre AUCUN MOT.
+          Tu es un assistant expert en structuration de cours médicaux (Résidanat).
+          TON OBJECTIF : Convertir ce texte brut en JSON structuré pour un document Word professionnel.
+          
+          AVERTISSEMENT CRITIQUE : 
+          1. NE RÉSUME JAMAIS. Copie chaque mot du texte original.
+          2. TRANSCRIS CHAQUE LIGNE DES ANNEXES, TABLEAUX ET LISTES DE CRITÈRES. 
+          3. INTERDICTION FORMELLE d'omettre du contenu technique ou des listes de médicaments/doses.
           
           PARTIE DU TEXTE (${i + 1}/${textChunks.length}) :
           """
@@ -91,16 +116,19 @@ export default function App() {
           
           Format JSON attendu :
           {
-            "title": "Titre (nécessaire pour la partie 1)",
-            "matter": "Matière (nécessaire pour la partie 1)",
+            "title": "Titre exact",
+            "matter": "Spécialité",
+            "objectives": ["Objectif 1", "Objectif 2"],
             "sections": [
               {
                 "level": 1,
-                "title": "Titre de section",
+                "title": "TITRE DE SECTION",
                 "content": [
                   { "type": "paragraph", "text": "Texte intégral..." },
                   { "type": "list", "items": ["Item intégral..."] },
-                  { "type": "important", "text": "Note intégrale..." }
+                  { "type": "important", "text": "Point clé..." },
+                  { "type": "image_placeholder", "description": "Légende de l'image (si présente)" },
+                  { "type": "annex", "text": "TRANSCRIPTION INTÉGRALE ET DÉTAILLÉE DE L'ANNEXE OU DU TABLEAU" }
                 ]
               }
             ],
@@ -108,30 +136,41 @@ export default function App() {
           }
           
           RÈGLES D'OR :
-          1. COPIE MOT POUR MOT. Ne résume pas. Ne change pas le style.
-          2. Si une phrase commence dans cette partie, finis-la.
-          3. Pour les parties après la n°1, laisse "title" et "matter" vides ou réutilise-les.
-          4. Réponds UNIQUEMENT avec le JSON.
+          1. COPIE MOT POUR MOT (VERBATIM). Chaque phrase doit être présente.
+          2. ANNEXES ET TABLEAUX : Utilise le type "annex" pour tout ce qui ressemble à un tableau ou une annexe. Transcris TOUT le texte qu'il contient.
+          3. DÉTECTION D'IMAGES : Crée un "image_placeholder" pour CHAQUE figure ou photo.
+          4. Pour les parties après la n°1, laisse "title", "matter" et "objectives" vides.
+          5. Réponds UNIQUEMENT avec le JSON brut.
         `;
 
         const aiResponse = await ai.models.generateContent({
           model: "gemini-3-flash-preview", 
-          contents: [{ role: "user", parts: [{ text: chunkPrompt }] }],
+          contents: { parts: [{ text: chunkPrompt }] },
         });
 
         const responseText = aiResponse.text;
+        if (!responseText) {
+          console.warn("L'IA a retourné une réponse vide pour le bloc ", i + 1);
+          continue;
+        }
+
         const jsonMatch = responseText.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
-          const partJson = JSON.parse(jsonMatch[0]);
-          if (i === 0) {
-            courseTitle = partJson.title || "Cours sans titre";
-            courseMatter = partJson.matter || "Médecine";
-          }
-          if (partJson.sections) {
-            fullStructuredSections.push(...partJson.sections);
-          }
-          if (partJson.keyTerms) {
-            courseKeyTerms = [...new Set([...courseKeyTerms, ...partJson.keyTerms])];
+          try {
+            const partJson = JSON.parse(jsonMatch[0]);
+            if (i === 0) {
+              courseTitle = partJson.title || "Cours sans titre";
+              courseMatter = partJson.matter || "Médecine";
+              courseObjectives = partJson.objectives || [];
+            }
+            if (partJson.sections) {
+              fullStructuredSections.push(...partJson.sections);
+            }
+            if (partJson.keyTerms) {
+              courseKeyTerms = [...new Set([...courseKeyTerms, ...partJson.keyTerms])];
+            }
+          } catch (e) {
+            console.error("JSON parse error in part ", i + 1, e);
           }
         }
       }
@@ -139,7 +178,7 @@ export default function App() {
       const structuredCourse = {
         title: courseTitle,
         matter: courseMatter,
-        objectives: [],
+        objectives: courseObjectives,
         sections: fullStructuredSections,
         keyTerms: courseKeyTerms
       };
@@ -203,6 +242,11 @@ export default function App() {
         </div>
 
         <div className="bg-white rounded-[2rem] shadow-2xl shadow-slate-200/60 p-8 border border-white overflow-hidden relative">
+          <div className="mb-6 p-4 bg-amber-50 border-l-4 border-amber-400 rounded-r-xl">
+            <p className="text-sm text-amber-800">
+              <strong>💡 Espacement intelligent :</strong> Les photos ne peuvent pas être extraites, mais l'IA réserve maintenant un espace suffisant (environ demi-page) dans Word pour que vous puissiez coller vos captures sans décaler la pagination.
+            </p>
+          </div>
           <AnimatePresence mode="wait">
             {status === 'idle' || status === 'error' ? (
               <motion.div

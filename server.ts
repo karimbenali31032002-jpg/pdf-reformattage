@@ -8,12 +8,9 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 let pdf: any;
 try {
-  // Try different require paths for pdf-parse
-  const pdfRaw = require("pdf-parse/lib/pdf-parse.js") || require("pdf-parse");
-  pdf = typeof pdfRaw === "function" ? pdfRaw : (pdfRaw.default || pdfRaw.pdfParse || pdfRaw);
-  console.log("pdf-parse successfully loaded.");
+  pdf = require("pdf-parse");
 } catch (e) {
-  console.error("Erreur lors de l'import de pdf-parse:", e);
+  console.error("Initial pdf-parse load failed:", e);
 }
 
 import { 
@@ -29,7 +26,8 @@ import {
   Header,
   Footer,
   PageNumber,
-  NumberFormat
+  NumberFormat,
+  ImageRun
 } from "docx";
 
 // --- COLORS ---
@@ -92,34 +90,60 @@ function enrichText(text: string, keyTerms: string[]) {
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
-  app.use(fileUpload());
+  app.use(fileUpload({
+    limits: { fileSize: 50 * 1024 * 1024 },
+    abortOnLimit: true
+  }));
+
+  // Request logger
+  app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    next();
+  });
 
   const PORT = 3000;
 
-  // Endpoint 1: Extract text from PDF
+  // Health check
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", pdfReady: typeof pdf === "function" });
+  });
+
+  // Endpoint 1: Extract text and images from PDF
   app.post("/api/extract-text", async (req, res) => {
     try {
+      console.log("Extraction request received");
       if (!req.files || !req.files.file) {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
       const uploadedFile = req.files.file as any;
-      if (typeof pdf !== "function") {
-        return res.status(500).json({ error: "PDF parser not configured" });
-      }
-
       const bufferData = Buffer.isBuffer(uploadedFile.data) ? uploadedFile.data : Buffer.from(uploadedFile.data);
+      
+      console.log(`Buffer size: ${bufferData.length} bytes`);
+
+      // Full text extraction with pdf-parse
+      if (typeof pdf !== "function") {
+        throw new Error("PDF parser is not correctly initialized on server.");
+      }
+      
       const pdfData = await pdf(bufferData);
       const rawText = pdfData?.text || "";
+
+      console.log(`Extracted text length: ${rawText.length}`);
 
       if (!rawText.trim()) {
         return res.status(400).json({ error: "No text found in PDF" });
       }
 
-      res.json({ text: rawText });
-    } catch (error) {
+      // Simple image detection via regex on raw PDF stream
+      const rawString = bufferData.toString("binary");
+      const imageMatches = rawString.match(/\/Subtype\s*\/Image/g) || [];
+      const imagesCount = imageMatches.length;
+
+      res.json({ text: rawText, imagesCount });
+    } catch (error: any) {
       console.error("Extraction error:", error);
-      res.status(500).json({ error: "Failed to extract text" });
+      res.status(500).json({ error: error?.message || "Failed to extract text" });
     }
   });
 
@@ -204,9 +228,28 @@ async function startServer() {
               spacing: { before: 2400, after: 600 },
             }),
             new Paragraph({
-              text: (structuredCourse?.matter || "").trim(),
               alignment: AlignmentType.CENTER,
+              children: [
+                new TextRun({
+                  text: (structuredCourse?.matter || "").trim(),
+                  size: 28,
+                  bold: true,
+                  color: COLORS.secondary,
+                }),
+              ],
               spacing: { after: 2400 },
+            }),
+            
+            new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [
+                new TextRun({
+                  text: "Document généré par Residanat Formatter IA",
+                  size: 16,
+                  color: COLORS.gray,
+                  italics: true,
+                }),
+              ],
             }),
             
             new Paragraph({ text: "Table des Matières", heading: HeadingLevel.HEADING_1, pageBreakBefore: true }),
@@ -238,6 +281,42 @@ async function startServer() {
               (section.content || []).forEach((item: any) => {
                 if (item.type === "paragraph") {
                   nodes.push(createRichParagraph(enrichText(item.text || "", structuredCourse?.keyTerms || [])));
+                } else if (item.type === "image_placeholder" || item.type === "annex") {
+                   const isAnnex = item.type === "annex";
+                   nodes.push(new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    children: [
+                      new TextRun({
+                        text: isAnnex ? "📎 ANNEXE / TABLEAU TRANSCRIT" : "📸 EMPLACEMENT ILLUSTRATION", 
+                        bold: true, 
+                        color: isAnnex ? COLORS.secondary : COLORS.primary,
+                        size: 24
+                      }),
+                      new TextRun({
+                        text: `\n${item.description || item.text || "Consulter le PDF pour le détail."}`,
+                        italics: true,
+                        color: COLORS.gray,
+                        size: 18
+                      }),
+                      new TextRun({
+                        text: isAnnex ? "" : "\n\n(ESPACE RÉSERVÉ POUR VOTRE CAPTURE D'ÉCRAN)\n\n\n\n\n\n\n\n",
+                        size: 14,
+                        color: COLORS.border
+                      })
+                    ],
+                    border: { 
+                      top: { style: BorderStyle.SINGLE, size: 8, color: isAnnex ? COLORS.secondary : COLORS.primary },
+                      bottom: { style: BorderStyle.SINGLE, size: 8, color: isAnnex ? COLORS.secondary : COLORS.primary },
+                      left: { style: BorderStyle.SINGLE, size: 8, color: isAnnex ? COLORS.secondary : COLORS.primary },
+                      right: { style: BorderStyle.SINGLE, size: 8, color: isAnnex ? COLORS.secondary : COLORS.primary },
+                    },
+                    shading: {
+                      type: ShadingType.SOLID,
+                      color: isAnnex ? "EBEEF5" : "F8FAFC",
+                      fill: isAnnex ? "EBEEF5" : "F8FAFC",
+                    },
+                    spacing: { before: 800, after: 4000 },
+                  }));
                 } else if (item.type === "list") {
                   (item.items || []).forEach((listItem: string) => {
                     nodes.push(new Paragraph({
